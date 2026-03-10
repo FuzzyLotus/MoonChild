@@ -1,1 +1,1049 @@
+// ============================================================
+// FLUX APPARITION — v4 "SW4 Character Fix + SW2 Push"
+// Concept:
+//   Motion (chorus) + Space (reverb) as one instrument
+//
+// K1 Motion   : Chorus movement rate
+// K2 Presence : Dry / Wet
+// K3 Bloom    : Reverb sustain / density
+// K4 Shape    : Chorus depth / spread
+// K5 Bond     : Chorus <-> Reverb relationship
+// K6 Color    : Global voicing (split internally for chorus/reverb)
+//
+// SW1 Halo      : Enables 3rd chorus voice
+// SW2 Bond Mode : Stronger series / interaction behavior
+// SW3 Orbit     : Wider / larger / cinematic mode
+// SW4 Character : Bright Plate <-> Dark Hall
+//
+// FS1 Tap  : Chorus on/off
+// FS1 Hold : Chorus freeze
+// FS2 Tap  : Reverb on/off
+// FS2 Hold : Reverb freeze
+//
+// Platform:
+//   Daisy Petal / DaisySP / 48kHz / Mono In / Mono Out
+// ============================================================
 
+#include "daisy_petal.h"
+#include "daisysp.h"
+#include "terrarium.h"
+#include <cmath>
+#include <cstring>
+#include <algorithm>
+
+using namespace daisy;
+using namespace daisysp;
+using namespace terrarium;
+
+static DaisyPetal petal;
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+static constexpr float SR_F         = 48000.0f;
+static constexpr float SR_OVER_1000 = 48.0f;
+static constexpr float TWO_PI_F     = 6.28318530718f;
+static constexpr float HALF_PI_F    = 1.57079632679f;
+static constexpr float PI_F_LOCAL   = 3.14159265359f;
+
+#define CHORUS_BUF_SIZE  4096
+#define REV_BUF_SIZE     12000
+
+static constexpr int FDN_N = 8;
+
+static constexpr int TAP_BRIGHT[FDN_N] = {
+    953, 1453, 2089, 2689, 3307, 4049, 4801, 5717
+};
+
+static constexpr int TAP_DARK[FDN_N] = {
+    1913, 2903, 4271, 5519, 6911, 8537, 10061, 11503
+};
+
+static constexpr float HOUSE_COEFF       = 2.0f / (float)FDN_N;
+static constexpr float XMOD_DAMP_RANGE   = 250.0f;
+
+static constexpr float TAP_MOD_RATES[FDN_N] = {
+    0.031f, 0.037f, 0.041f, 0.043f, 0.047f, 0.053f, 0.059f, 0.061f
+};
+
+static constexpr float TAP_MOD_DEPTH   = 3.5f;
+static constexpr float XFEED_MOD_DEPTH = 0.45f;
+static constexpr float LATE_TAP_FRAC   = 0.55f;
+
+// Allpass sizes
+#define AP_L1  82
+#define AP_L2  110
+#define AP_L3  149
+#define AP_R1  89
+#define AP_R2  118
+#define AP_R3  157
+
+// Input diffuser sizes
+#define INDIFF_A  31
+#define INDIFF_B  47
+#define INDIFF_C  67
+#define INDIFF_D  97
+#define INDIFF_E  127
+#define INDIFF_F  163
+
+// ============================================================
+// FAST MATH / HELPERS
+// ============================================================
+static inline float fast_sin7(float x)
+{
+    float x2 = x * x;
+    return x * (1.0f - x2 * (0.16666667f - x2 * (0.00833333f - x2 * 0.000198413f)));
+}
+
+static inline float fast_sine_phase(float p)
+{
+    return fast_sin7((p - 0.5f) * TWO_PI_F);
+}
+
+static inline float fast_sin_hp(float x)
+{
+    float x2 = x * x;
+    return x * (1.0f - x2 * (0.16666667f - x2 * 0.00833333f));
+}
+
+static inline float fast_cos_hp(float x)
+{
+    float x2 = x * x;
+    return 1.0f - x2 * (0.5f - x2 * 0.04166667f);
+}
+
+static inline float fast_tanh(float x)
+{
+    return x / (1.0f + fabsf(x));
+}
+
+static inline float tape_warm(float x)
+{
+    return x - 0.15f * x * x * x;
+}
+
+static inline float soft_limit(float x)
+{
+    float ax = fabsf(x);
+    if(ax < 0.7f)
+        return x;
+    float k = (ax - 0.7f) * 1.5f;
+    return x / (1.0f + k * ax);
+}
+
+static inline float bbd_saturate(float x)
+{
+    return x / (1.0f + fabsf(x));
+}
+
+static inline float tri01(float p)
+{
+    float x = p - floorf(p);
+    return (x < 0.5f) ? (x * 2.0f) : (2.0f - x * 2.0f);
+}
+
+static inline float clampf(float x, float lo, float hi)
+{
+    return std::max(lo, std::min(x, hi));
+}
+
+static inline float clamp01(float x)
+{
+    return clampf(x, 0.0f, 1.0f);
+}
+
+static inline float smoothshape01(float x)
+{
+    x = clamp01(x);
+    return x * x * (3.0f - 2.0f * x);
+}
+
+// ============================================================
+// BASIC FILTERS
+// ============================================================
+struct Lp1
+{
+    float y, c;
+    void Init(float freq, float sr)
+    {
+        y = 0.0f;
+        c = 1.0f - expf(-TWO_PI_F * freq / sr);
+    }
+    void SetFreq(float freq, float sr)
+    {
+        c = 1.0f - expf(-TWO_PI_F * freq / sr);
+    }
+    float Process(float x)
+    {
+        y += c * (x - y);
+        return y;
+    }
+};
+
+struct Hp1
+{
+    float y, c;
+    void Init(float freq, float sr)
+    {
+        y = 0.0f;
+        c = 1.0f - expf(-TWO_PI_F * freq / sr);
+    }
+    void SetFreq(float freq, float sr)
+    {
+        c = 1.0f - expf(-TWO_PI_F * freq / sr);
+    }
+    float Process(float x)
+    {
+        y += c * (x - y);
+        return x - y;
+    }
+};
+
+struct BbdSvf
+{
+    float lo, bp, f, damp;
+    void Init(float freq, float q, float sr)
+    {
+        lo = bp = 0.0f;
+        SetFreq(freq, q, sr);
+    }
+    void SetFreq(float freq, float q, float sr)
+    {
+        freq = std::min(freq, sr * 0.45f);
+        f    = 2.0f * fast_sin7(PI_F_LOCAL * freq / sr);
+        damp = 1.0f / q;
+    }
+    float Process(float x)
+    {
+        float hp = x - lo - damp * bp;
+        bp += f * hp;
+        lo += f * bp;
+        return bp * 0.5f + lo * 0.5f;
+    }
+};
+
+struct SimpleDcBlock
+{
+    float x1, y1, r;
+    void Init(float coeff = 0.995f)
+    {
+        x1 = 0.0f;
+        y1 = 0.0f;
+        r  = coeff;
+    }
+    float Process(float x)
+    {
+        float y = x - x1 + r * y1;
+        x1 = x;
+        y1 = y;
+        return y;
+    }
+};
+
+struct Ap
+{
+    float* buf;
+    size_t len, wp;
+    float  g;
+    void Init(float* mem, size_t n, float coeff)
+    {
+        buf = mem;
+        len = n;
+        wp  = 0;
+        g   = coeff;
+        memset(buf, 0, n * sizeof(float));
+    }
+    float Process(float x)
+    {
+        float rd = buf[wp];
+        float w  = x + rd * g;
+        buf[wp]  = w;
+        wp       = (wp + 1) % len;
+        return rd - w * g;
+    }
+};
+
+struct DelBuf
+{
+    float* buf;
+    size_t len, wp;
+    void Init(float* mem, size_t n)
+    {
+        buf = mem;
+        len = n;
+        wp  = 0;
+        memset(buf, 0, n * sizeof(float));
+    }
+    void Write(float s)
+    {
+        buf[wp] = s;
+        wp      = (wp + 1) % len;
+    }
+    float Read(float samps) const
+    {
+        samps = clampf(samps, 1.0f, (float)(len - 2));
+        float r = (float)wp - samps;
+        if(r < 0.0f)
+            r += (float)len;
+
+        int   i0 = (int)r;
+        float fr = r - (float)i0;
+        int   i1 = i0 + 1;
+        if(i1 >= (int)len)
+            i1 -= (int)len;
+        if(i0 >= (int)len)
+            i0 -= (int)len;
+
+        return buf[i0] * (1.0f - fr) + buf[i1] * fr;
+    }
+};
+
+// ============================================================
+// VELVET NOISE
+// ============================================================
+struct VelvetNoise
+{
+    uint32_t lfsr;
+    int      counter;
+
+    void Init()
+    {
+        lfsr    = 0xDEADBEEF;
+        counter = 0;
+    }
+
+    float Process()
+    {
+        uint32_t bit = ((lfsr >> 31) ^ (lfsr >> 21) ^ (lfsr >> 1) ^ lfsr) & 1u;
+        lfsr         = (lfsr << 1) | bit;
+
+        counter++;
+        int spacing = 19 + (int)((lfsr >> 16) & 0x7) - 4;
+        if(counter >= spacing)
+        {
+            counter = 0;
+            return (lfsr & 2u) ? 0.0001f : -0.0001f;
+        }
+        return 0.0f;
+    }
+};
+
+// ============================================================
+// RANDOM WALK
+// ============================================================
+struct RandWalk
+{
+    uint32_t lfsr;
+    float filtered;
+    float position;
+    float smoothC;
+
+    void Init(uint32_t seed, float speed, float sr)
+    {
+        lfsr     = seed;
+        filtered = 0.0f;
+        position = 0.0f;
+        smoothC  = 1.0f - expf(-TWO_PI_F * speed / sr);
+    }
+
+    float Process(float maxDepth)
+    {
+        uint32_t bit = ((lfsr >> 31) ^ (lfsr >> 21) ^ (lfsr >> 1) ^ lfsr) & 1u;
+        lfsr         = (lfsr << 1) | bit;
+
+        float noise = (float)(int32_t)(lfsr) * (1.0f / 2147483648.0f);
+        filtered += smoothC * (noise - filtered);
+        position += filtered * 0.02f;
+
+        if(position > maxDepth)
+            position = maxDepth - (position - maxDepth);
+        if(position < -maxDepth)
+            position = -maxDepth - (position + maxDepth);
+
+        return position;
+    }
+};
+
+// ============================================================
+// SDRAM BUFFERS
+// ============================================================
+static float DSY_SDRAM_BSS chorusBufA[CHORUS_BUF_SIZE];
+static float DSY_SDRAM_BSS chorusBufB[CHORUS_BUF_SIZE];
+static float DSY_SDRAM_BSS chorusBufC[CHORUS_BUF_SIZE];
+
+static float DSY_SDRAM_BSS revBufA[REV_BUF_SIZE];
+static float DSY_SDRAM_BSS revBufB[REV_BUF_SIZE];
+static float DSY_SDRAM_BSS revBufC[REV_BUF_SIZE];
+static float DSY_SDRAM_BSS revBufD[REV_BUF_SIZE];
+static float DSY_SDRAM_BSS revBufE[REV_BUF_SIZE];
+static float DSY_SDRAM_BSS revBufF[REV_BUF_SIZE];
+static float DSY_SDRAM_BSS revBufG[REV_BUF_SIZE];
+static float DSY_SDRAM_BSS revBufH[REV_BUF_SIZE];
+
+// Small SRAM buffers
+static float apMemL1[AP_L1], apMemL2[AP_L2], apMemL3[AP_L3];
+static float apMemR1[AP_R1], apMemR2[AP_R2], apMemR3[AP_R3];
+static float inDiffMemA[INDIFF_A], inDiffMemB[INDIFF_B];
+static float inDiffMemC[INDIFF_C], inDiffMemD[INDIFF_D];
+static float inDiffMemE[INDIFF_E], inDiffMemF[INDIFF_F];
+
+// ============================================================
+// DSP OBJECTS
+// ============================================================
+// Chorus
+static DelBuf        chDel[3];
+static Lp1           chWriteLpf;
+static Hp1           chWriteHpf;
+static Lp1           chVoiceLpf[3];
+static SimpleDcBlock chVoiceDc[3];
+static float         chPhaseA = 0.0f;
+static float         chPhaseB = 0.333f;
+static float         chPhaseC = 0.666f;
+
+// Reverb
+static DelBuf rvDel[FDN_N];
+static Lp1    rvDamp[FDN_N];
+static Hp1    rvHpfL, rvHpfR;
+static Ap     inDiff[6];
+static RandWalk tapWalk[FDN_N];
+static VelvetNoise velvet;
+
+// Shared / tone
+static Hp1    inputHpf;
+static Lp1    inputLpf;
+static Ap     apL[3], apR[3];
+static BbdSvf chorusToneL, chorusToneR;
+static BbdSvf reverbToneL, reverbToneR;
+static Lp1    revEnergyLpf;
+static float  revEnergy = 0.0f;
+static Lp1    cascLpf;
+static Hp1    cascHpf;
+
+// ============================================================
+// STATE / CONTROLS
+// ============================================================
+static float tMotion = 0.7f, sMotion = 0.7f;
+static float tPresence = 0.0f, sPresence = 0.0f;
+static float tBloom = 0.55f, sBloom = 0.55f;
+static float tShape = 1.2f, sShape = 1.2f;
+static float tBond = 0.5f, sBond = 0.5f;
+static float tColor = 1800.0f, sColor = 1800.0f;
+
+static float tHalo = 0.0f, sHalo = 0.0f;
+static float tBondMode = 0.0f, sBondMode = 0.0f;
+static float tOrbit = 0.0f, sOrbit = 0.0f;
+static float tCharacter = 0.0f, sCharacter = 0.0f;
+
+static float tChOn = 0.0f, sChOn = 0.0f;
+static float tRvOn = 0.0f, sRvOn = 0.0f;
+static float tChFz = 0.0f, sChFz = 0.0f;
+static float tRvFz = 0.0f, sRvFz = 0.0f;
+
+static bool chorusOn = false;
+static bool reverbOn = false;
+static bool chorusFz = false;
+static bool reverbFz = false;
+
+static bool fs1Prev = false, fs1Held = false;
+static int  fs1Timer = 0, fs1Lockout = 0;
+static bool fs2Prev = false, fs2Held = false;
+static int  fs2Timer = 0, fs2Lockout = 0;
+
+static float prevChOut   = 0.0f;
+static float prevRvOut   = 0.0f;
+static float prevCascOut = 0.0f;
+static float vnEnv       = 0.0f;
+static float driftPhase  = 0.0f;
+static float driftVal    = 0.0f;
+
+static constexpr float DRIFT_FREQ   = 0.07f;
+static constexpr float DRIFT_AMOUNT = 0.22f;
+
+static Led led1, led2;
+static Parameter pMotion, pPresence, pBloom, pShape, pBond, pColor;
+
+// ============================================================
+// CHORUS ENGINE
+// ============================================================
+static inline void processChorus(float input, float rateHz, float shapeDepth,
+                                 float &outL, float &outR)
+{
+    float bond  = sBond;
+    float orbit = sOrbit;
+    float halo  = sHalo;
+
+    chPhaseA += rateHz / SR_F;
+    chPhaseB += rateHz * 0.83f / SR_F;
+    chPhaseC += rateHz * 0.61f / SR_F;
+
+    if(chPhaseA >= 1.0f) chPhaseA -= 1.0f;
+    if(chPhaseB >= 1.0f) chPhaseB -= 1.0f;
+    if(chPhaseC >= 1.0f) chPhaseC -= 1.0f;
+
+    float lfoA = tri01(chPhaseA);
+    float lfoB = tri01(chPhaseB);
+    float lfoC = tri01(chPhaseC);
+
+    float baseMs  = 7.9f + bond * 0.8f + orbit * 0.9f;
+    float depthMs = shapeDepth * (0.56f + orbit * 0.18f + halo * 0.04f);
+    depthMs       = std::min(depthMs, 2.45f);
+
+    float dA_ms = baseMs + lfoA * depthMs;
+    float dB_ms = (baseMs + 1.9f) + lfoB * (depthMs * 0.90f);
+    float dC_ms = (baseMs + 4.6f) + lfoC * (depthMs * 0.92f);
+
+    float dA = dA_ms * SR_OVER_1000;
+    float dB = dB_ms * SR_OVER_1000;
+    float dC = dC_ms * SR_OVER_1000;
+
+    dA = clampf(dA, 2.0f, (float)(CHORUS_BUF_SIZE - 3));
+    dB = clampf(dB, 2.0f, (float)(CHORUS_BUF_SIZE - 3));
+    dC = clampf(dC, 2.0f, (float)(CHORUS_BUF_SIZE - 3));
+
+    float writeSig = chWriteHpf.Process(chWriteLpf.Process(input));
+
+    bool frozen = sChFz > 0.5f;
+    if(frozen)
+    {
+        chDel[0].Write(chDel[0].Read(dA) * 0.9995f);
+        chDel[1].Write(chDel[1].Read(dB) * 0.9995f);
+        chDel[2].Write(chDel[2].Read(dC) * 0.9995f);
+    }
+    else
+    {
+        chDel[0].Write(writeSig);
+        chDel[1].Write(writeSig);
+        chDel[2].Write(writeSig);
+    }
+
+    float vA = chDel[0].Read(dA);
+    float vB = chDel[1].Read(dB);
+    float vC = chDel[2].Read(dC);
+
+    vA = chVoiceDc[0].Process(chVoiceLpf[0].Process(vA));
+    vB = chVoiceDc[1].Process(chVoiceLpf[1].Process(vB));
+    vC = chVoiceDc[2].Process(chVoiceLpf[2].Process(vC));
+
+    float width = 0.24f + orbit * 0.12f + halo * 0.05f + (1.0f - bond) * 0.03f;
+    float glue  = halo * 0.78f;
+    float cSide = halo * 0.22f;
+
+    float mid  = (vA + vB) * 0.5f;
+    float side = (vA - vB) * width;
+
+    float left  = mid + side + vC * (glue + cSide);
+    float right = mid - side + vC * (glue - cSide);
+
+    left  = tape_warm(left * 0.93f);
+    right = tape_warm(right * 0.93f);
+
+    outL = bbd_saturate(left);
+    outR = bbd_saturate(right);
+}
+
+// ============================================================
+// REVERB ENGINE
+// ============================================================
+static inline void processReverb(float input, float &outL, float &outR)
+{
+    float bond      = sBond;
+    float orbit     = sOrbit;
+    float character = sCharacter;
+    float series    = sBondMode;
+
+    float inGain = 1.0f - 0.85f * sRvFz;
+
+    float fbCoeff = sBloom
+                  + bond * 0.060f
+                  + orbit * 0.040f
+                  + series * 0.022f;
+    fbCoeff = std::min(fbCoeff, 0.948f);
+
+    float diffused = input;
+    for(int s = 0; s < 6; s++)
+        diffused = inDiff[s].Process(diffused);
+
+    float inRect = fabsf(input);
+    if(inRect > vnEnv)
+        vnEnv += 0.05f * (inRect - vnEnv);
+    else
+        vnEnv *= 0.9999f;
+
+    float vnGate  = std::min(1.0f, vnEnv * 15.0f) * (1.0f - sRvFz);
+    float rvInput = diffused + velvet.Process() * vnGate;
+
+    // Character is deliberately kept OUT of the tank voicing to avoid the SW4 pop.
+    rvInput *= (0.96f + bond * 0.07f + orbit * 0.06f + series * 0.03f);
+
+    float baseTaps[FDN_N];
+    for(int t = 0; t < FDN_N; t++)
+    {
+        // Fixed stable tank voicing; SW4 handled outside the tank
+        baseTaps[t] = (float)TAP_BRIGHT[t];
+    }
+
+    float modDepthTap = TAP_MOD_DEPTH * (1.0f - sRvFz * 0.8f);
+    float walk[FDN_N];
+    for(int t = 0; t < FDN_N; t++)
+        walk[t] = tapWalk[t].Process(modDepthTap);
+
+    float xModScale = XFEED_MOD_DEPTH / TAP_MOD_DEPTH;
+    walk[2] += walk[6] * xModScale;
+    walk[5] += walk[1] * xModScale;
+    walk[4] += walk[0] * xModScale;
+    walk[7] += walk[3] * xModScale;
+
+    float rd[FDN_N];
+    for(int t = 0; t < FDN_N; t++)
+        rd[t] = rvDel[t].Read(baseTaps[t] + walk[t]);
+
+    float rdSum = 0.0f;
+    for(int t = 0; t < FDN_N; t++)
+        rdSum += rd[t];
+
+    revEnergy = revEnergyLpf.Process(fabsf(rdSum) / (float)FDN_N);
+
+    static constexpr float INV_SQRT_N = 0.354f;
+    float inputScaled = rvInput * inGain * INV_SQRT_N;
+
+    for(int t = 0; t < FDN_N; t++)
+    {
+        float mixed    = rd[t] - HOUSE_COEFF * rdSum;
+        float filtered = rvDamp[t].Process(mixed);
+        float fbInput  = filtered + (mixed - filtered) * (sRvFz * 0.33f + orbit * 0.05f);
+        float fb       = fbInput * fbCoeff;
+        float fbClip   = fast_tanh(fb);
+        fb             = fbClip + (fb - fbClip) * sRvFz;
+        rvDel[t].Write(inputScaled + fb);
+    }
+
+    float lateL = 0.0f;
+    float lateR = 0.0f;
+    float plateLate = 0.020f + orbit * 0.003f + series * 0.002f;
+    float hallLate  = 0.044f + orbit * 0.009f + series * 0.006f;
+    float lateLevel = plateLate + (hallLate - plateLate) * character;
+
+    for(int t = 0; t < FDN_N; t++)
+    {
+        float latePos = baseTaps[t] * LATE_TAP_FRAC;
+        float lt      = rvDel[t].Read(latePos) * lateLevel;
+        float sign    = (t & 1) ? -1.0f : 1.0f;
+        lateL += lt * sign;
+        lateR -= lt * sign;
+    }
+
+    float plateMain = 0.66f + orbit * 0.01f;
+    float hallMain  = 0.50f + orbit * 0.03f;
+    float mainGain  = plateMain + (hallMain - plateMain) * character;
+
+    float mainL = (rd[0] + rd[3] + rd[4] + rd[7]) * mainGain;
+    float mainR = (rd[1] + rd[2] + rd[5] + rd[6]) * mainGain;
+
+    float rawL = mainL + lateL;
+    float rawR = mainR + lateR;
+
+    outL = rvHpfL.Process(rawL);
+    outR = rvHpfR.Process(rawR);
+}
+
+// ============================================================
+// AUDIO CALLBACK
+// ============================================================
+static void AudioCallback(AudioHandle::InputBuffer in,
+                          AudioHandle::OutputBuffer out,
+                          size_t size)
+{
+    for(size_t i = 0; i < size; i++)
+    {
+        // Smooth controls
+        fonepole(sMotion,   tMotion,   0.005f);
+        fonepole(sPresence, tPresence, 0.005f);
+        fonepole(sBloom,    tBloom,    0.005f);
+        fonepole(sShape,    tShape,    0.002f);
+        fonepole(sBond,     tBond,     0.002f);
+        fonepole(sColor,    tColor,    0.005f);
+
+        fonepole(sHalo,      tHalo,      0.002f);
+        fonepole(sBondMode,  tBondMode,  0.002f);
+        fonepole(sOrbit,     tOrbit,     0.002f);
+        fonepole(sCharacter, tCharacter, 0.0008f);
+
+        fonepole(sChOn,     tChOn,     0.002f);
+        fonepole(sRvOn,     tRvOn,     0.002f);
+
+        float rvFzC = (tRvFz > sRvFz) ? 0.004f : 0.00002f;
+        float chFzC = (tChFz > sChFz) ? 0.004f : 0.00002f;
+        fonepole(sRvFz, tRvFz, rvFzC);
+        fonepole(sChFz, tChFz, chFzC);
+
+        // Input conditioning
+        float raw = in[0][i];
+        float dry = tape_warm(inputHpf.Process(inputLpf.Process(raw)));
+
+        float anyOn = std::min(1.0f, sChOn + sRvOn);
+
+        // Slow drift
+        driftPhase += DRIFT_FREQ / SR_F;
+        if(driftPhase >= 1.0f)
+            driftPhase -= 1.0f;
+        driftVal = fast_sine_phase(driftPhase);
+
+        float dynDrift = std::min(DRIFT_AMOUNT * (1.0f + revEnergy * 1.2f), 0.6f);
+        float shapeDepth = sShape * (1.0f + driftVal * dynDrift);
+
+        float bondMacro = smoothshape01(sBond);
+        float orbitRate = sMotion * (1.0f - sOrbit * 0.15f) + sOrbit * 0.03f;
+
+        // Chorus
+        float chIn = dry * sChOn;
+        chIn = soft_limit(chIn);
+
+        float chL = 0.0f, chR = 0.0f;
+        processChorus(chIn, orbitRate, shapeDepth, chL, chR);
+        float chMono = (chL + chR) * 0.5f;
+
+        // Bond system
+        float bondModeAmt   = sBondMode;
+        float bondModeBoost = 1.0f + bondModeAmt * 0.95f;
+        float bondCurve     = clampf(bondMacro * bondModeBoost, 0.0f, 1.55f);
+
+        float dryToReverb = 1.0f - bondMacro * (0.62f + bondModeAmt * 0.34f);
+        dryToReverb = clampf(dryToReverb, 0.05f, 1.0f);
+
+        float rvEnable = std::min(1.0f, sRvOn + sRvFz);
+        float rvIn = dry * dryToReverb * rvEnable;
+        rvIn += chMono * bondCurve * rvEnable * (0.95f + sOrbit * 0.06f);
+
+        // SW2 recommendation: more obvious density / series feel
+        float cleanCasc = cascHpf.Process(cascLpf.Process(prevCascOut));
+        float cascFb    = fast_tanh(cleanCasc * sBondMode * 0.24f);
+        rvIn += cascFb * rvEnable * (0.28f + bondMacro * 0.14f);
+
+        rvIn = soft_limit(rvIn);
+
+        float rvL = 0.0f, rvR = 0.0f;
+        processReverb(rvIn, rvL, rvR);
+
+        prevChOut   = chMono;
+        prevRvOut   = (rvL + rvR) * 0.5f;
+        prevCascOut = prevRvOut * 0.5f + prevChOut * 0.5f;
+
+        // Per-engine tone shaping
+        float chToneL = chorusToneL.Process(chL);
+        float chToneR = chorusToneR.Process(chR);
+
+        // SW4 handled safely outside the tank:
+        // plate = more forward / brighter / body
+        // hall  = darker / receding / softer
+        float characterPlate = 1.0f - sCharacter;
+        float characterHall  = sCharacter;
+        float rvPreTone      = 1.0f - characterHall * 0.10f;
+        float rvBodyTilt     = 1.0f + characterPlate * 0.06f - characterHall * 0.03f;
+
+        float rvToneL = reverbToneL.Process(rvL * rvPreTone) * rvBodyTilt;
+        float rvToneR = reverbToneR.Process(rvR * rvPreTone) * rvBodyTilt;
+
+        float chLevel = sChOn * (0.98f + (1.0f - bondMacro) * 0.20f + sHalo * 0.11f + sOrbit * 0.04f);
+        float rvLevel = sRvOn * (0.94f + bondMacro * 0.70f + sOrbit * 0.14f - sCharacter * 0.03f);
+
+        if(sBondMode > 0.5f)
+        {
+            rvLevel += bondMacro * 0.26f;
+            chLevel -= bondMacro * 0.12f;
+        }
+        chLevel = std::max(0.0f, chLevel);
+
+        float wetL = chToneL * chLevel + rvToneL * rvLevel;
+        float wetR = chToneR * chLevel + rvToneR * rvLevel;
+
+        float wetBloom = 1.30f + sOrbit * 0.16f + bondMacro * 0.10f;
+        if(sBondMode > 0.5f)
+            wetBloom += 0.06f + bondMacro * 0.10f;
+        wetL *= wetBloom;
+        wetR *= wetBloom;
+
+        float fzBoost = 1.0f + std::max(sRvFz, sChFz) * 0.25f;
+        wetL *= fzBoost;
+        wetR *= fzBoost;
+
+        wetL = tape_warm(wetL);
+        wetR = tape_warm(wetR);
+
+        // Gentle output diffusion
+        apL[0].g = 0.6f; apL[1].g = 0.6f; apL[2].g = 0.6f;
+        apR[0].g = 0.6f; apR[1].g = 0.6f; apR[2].g = 0.6f;
+
+        wetL = apL[0].Process(wetL);
+        wetL = apL[1].Process(wetL);
+        wetL = apL[2].Process(wetL);
+
+        wetR = apR[0].Process(wetR);
+        wetR = apR[1].Process(wetR);
+        wetR = apR[2].Process(wetR);
+
+        float wetMono = (wetL + wetR) * 0.84f;
+
+        // Presence control
+        float mixShaped = powf(sPresence, 0.62f);
+        float mixAngle  = mixShaped * HALF_PI_F;
+        float dryGain   = fast_cos_hp(mixAngle);
+        float wetGain   = fast_sin_hp(mixAngle) * 1.24f;
+
+        float processed = dry * dryGain + wetMono * wetGain;
+        float output    = dry * (1.0f - anyOn) + processed * anyOn;
+
+        output = soft_limit(output);
+
+        out[0][i] = output;
+        out[1][i] = output;
+    }
+}
+
+// ============================================================
+// CONTROLS
+// ============================================================
+static void UpdateControls()
+{
+    petal.ProcessAnalogControls();
+    petal.ProcessDigitalControls();
+    led1.Update();
+    led2.Update();
+
+    // Knobs
+    tMotion   = pMotion.Process();
+    tPresence = pPresence.Process();
+    tBloom    = pBloom.Process();
+
+    float rawShape = pShape.Process();
+    float normShape = (rawShape - 0.2f) / (5.0f - 0.2f);
+    normShape       = clamp01(normShape);
+    normShape       = normShape * normShape * (3.0f - 2.0f * normShape);
+    tShape          = 0.2f + normShape * (5.0f - 0.2f);
+
+    tBond  = pBond.Process();
+    tColor = pColor.Process();
+
+    // Split tone behavior
+    float colorNorm = clamp01((tColor - 300.0f) / (5000.0f - 300.0f));
+    float chorusToneFreq = 650.0f + colorNorm * 3450.0f;  // 650 -> 4100
+    float reverbToneFreq = 450.0f + colorNorm * 1950.0f;  // 450 -> 2400
+
+    chorusToneL.SetFreq(chorusToneFreq, 0.95f, SR_F);
+    chorusToneR.SetFreq(chorusToneFreq, 0.95f, SR_F);
+    reverbToneL.SetFreq(reverbToneFreq, 0.85f, SR_F);
+    reverbToneR.SetFreq(reverbToneFreq, 0.85f, SR_F);
+
+    // Stable tank damping; SW4 no longer alters this directly
+    float dampBase = 4300.0f;
+    dampBase += sBond * -650.0f;
+    dampBase += sOrbit * -500.0f;
+    dampBase += sBondMode * -220.0f;
+
+    float dampXmod = driftVal * (XMOD_DAMP_RANGE * 0.35f);
+    float dampFreq = clampf(dampBase + dampXmod, 320.0f, 7200.0f);
+
+    for(int t = 0; t < FDN_N; t++)
+        rvDamp[t].SetFreq(dampFreq, SR_F);
+
+    // Toggles
+    tHalo      = petal.switches[Terrarium::SWITCH_1].Pressed() ? 1.0f : 0.0f;
+    tBondMode  = petal.switches[Terrarium::SWITCH_2].Pressed() ? 1.0f : 0.0f;
+    tOrbit     = petal.switches[Terrarium::SWITCH_3].Pressed() ? 1.0f : 0.0f;
+    tCharacter = petal.switches[Terrarium::SWITCH_4].Pressed() ? 1.0f : 0.0f;
+
+    // FS1 - Chorus
+    if(fs1Lockout > 0)
+    {
+        fs1Lockout--;
+    }
+    else
+    {
+        bool fs1Now  = petal.switches[Terrarium::FOOTSWITCH_1].Pressed();
+        bool fs1Rise = fs1Now && !fs1Prev;
+        bool fs1Fall = !fs1Now && fs1Prev;
+
+        if(fs1Rise)
+        {
+            fs1Timer = 0;
+            fs1Held  = false;
+        }
+
+        if(fs1Now && !fs1Held)
+        {
+            fs1Timer++;
+            if(fs1Timer >= 250)
+            {
+                fs1Held = true;
+                if(chorusOn)
+                {
+                    chorusFz = !chorusFz;
+                    fs1Lockout = 200;
+                }
+            }
+        }
+
+        if(fs1Fall && !fs1Held)
+        {
+            chorusOn = !chorusOn;
+            if(!chorusOn)
+                chorusFz = false;
+            fs1Lockout = 200;
+        }
+
+        fs1Prev = fs1Now;
+    }
+
+    tChOn = chorusOn ? 1.0f : 0.0f;
+    tChFz = chorusFz ? 1.0f : 0.0f;
+    led1.Set(chorusOn ? (chorusFz ? 0.65f : 1.0f) : 0.0f);
+
+    // FS2 - Reverb / Freeze
+    if(fs2Lockout > 0)
+    {
+        fs2Lockout--;
+    }
+    else
+    {
+        bool fs2Now  = petal.switches[Terrarium::FOOTSWITCH_2].Pressed();
+        bool fs2Rise = fs2Now && !fs2Prev;
+        bool fs2Fall = !fs2Now && fs2Prev;
+
+        if(fs2Rise)
+        {
+            fs2Timer = 0;
+            fs2Held  = false;
+        }
+
+        if(fs2Now && !fs2Held)
+        {
+            fs2Timer++;
+            if(fs2Timer >= 250)
+            {
+                fs2Held = true;
+                reverbFz = !reverbFz;
+                if(reverbFz && !reverbOn)
+                    reverbOn = true;
+                fs2Lockout = 200;
+            }
+        }
+
+        if(fs2Fall && !fs2Held)
+        {
+            reverbOn = !reverbOn;
+            if(!reverbOn)
+                reverbFz = false;
+            fs2Lockout = 200;
+        }
+
+        fs2Prev = fs2Now;
+    }
+
+    tRvOn = reverbOn ? 1.0f : 0.0f;
+    tRvFz = reverbFz ? 1.0f : 0.0f;
+    led2.Set(reverbOn ? (reverbFz ? 0.65f : 1.0f) : 0.0f);
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+int main()
+{
+    petal.Init();
+    petal.SetAudioBlockSize(1);
+    petal.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
+    float sr = petal.AudioSampleRate();
+
+    uint32_t fpscr = __get_FPSCR();
+    fpscr |= (1 << 24);
+    __set_FPSCR(fpscr);
+
+    // Chorus init
+    chDel[0].Init(chorusBufA, CHORUS_BUF_SIZE);
+    chDel[1].Init(chorusBufB, CHORUS_BUF_SIZE);
+    chDel[2].Init(chorusBufC, CHORUS_BUF_SIZE);
+
+    chWriteLpf.Init(3000.0f, sr);
+    chWriteHpf.Init(130.0f, sr);
+    for(int v = 0; v < 3; v++)
+    {
+        chVoiceLpf[v].Init(2600.0f, sr);
+        chVoiceDc[v].Init(0.995f);
+    }
+
+    // Reverb init
+    float* rvMem[FDN_N] = {
+        revBufA, revBufB, revBufC, revBufD,
+        revBufE, revBufF, revBufG, revBufH
+    };
+
+    for(int t = 0; t < FDN_N; t++)
+    {
+        rvDel[t].Init(rvMem[t], REV_BUF_SIZE);
+        rvDamp[t].Init(5400.0f, sr);
+
+        uint32_t seed = 0xDEAD0000u + (uint32_t)(t * 0x1234567);
+        tapWalk[t].Init(seed, TAP_MOD_RATES[t], sr);
+    }
+
+    rvHpfL.Init(60.0f, sr);
+    rvHpfR.Init(60.0f, sr);
+
+    float* inDiffMem[6] = {
+        inDiffMemA, inDiffMemB, inDiffMemC,
+        inDiffMemD, inDiffMemE, inDiffMemF
+    };
+    int inDiffLen[6] = {
+        INDIFF_A, INDIFF_B, INDIFF_C,
+        INDIFF_D, INDIFF_E, INDIFF_F
+    };
+    for(int s = 0; s < 6; s++)
+        inDiff[s].Init(inDiffMem[s], inDiffLen[s], 0.67f);
+
+    velvet.Init();
+
+    // Input / shared
+    inputHpf.Init(80.0f, sr);
+    inputLpf.Init(7600.0f, sr);
+    cascLpf.Init(900.0f, sr);
+    cascHpf.Init(110.0f, sr);
+    revEnergyLpf.Init(5.0f, sr);
+
+    // Output diffusion
+    apL[0].Init(apMemL1, AP_L1, 0.6f);
+    apL[1].Init(apMemL2, AP_L2, 0.6f);
+    apL[2].Init(apMemL3, AP_L3, 0.6f);
+    apR[0].Init(apMemR1, AP_R1, 0.6f);
+    apR[1].Init(apMemR2, AP_R2, 0.6f);
+    apR[2].Init(apMemR3, AP_R3, 0.6f);
+
+    // Tone
+    chorusToneL.Init(1800.0f, 0.95f, sr);
+    chorusToneR.Init(1800.0f, 0.95f, sr);
+    reverbToneL.Init(1300.0f, 0.85f, sr);
+    reverbToneR.Init(1300.0f, 0.85f, sr);
+
+    // Params
+    pMotion.Init(  petal.knob[Terrarium::KNOB_1], 0.08f, 2.8f,   Parameter::LINEAR);
+    pPresence.Init(petal.knob[Terrarium::KNOB_2], 0.0f,  1.0f,   Parameter::LINEAR);
+    pBloom.Init(   petal.knob[Terrarium::KNOB_3], 0.30f, 0.88f,  Parameter::LINEAR);
+    pShape.Init(   petal.knob[Terrarium::KNOB_4], 0.2f,  5.0f,   Parameter::LINEAR);
+    pBond.Init(    petal.knob[Terrarium::KNOB_5], 0.0f,  1.0f,   Parameter::LINEAR);
+    pColor.Init(   petal.knob[Terrarium::KNOB_6], 300.0f,5000.0f,Parameter::LOGARITHMIC);
+
+    led1.Init(petal.seed.GetPin(Terrarium::LED_1), false);
+    led2.Init(petal.seed.GetPin(Terrarium::LED_2), false);
+
+    chorusOn = false;
+    reverbOn = false;
+    chorusFz = false;
+    reverbFz = false;
+
+    petal.StartAdc();
+    petal.StartAudio(AudioCallback);
+
+    while(true)
+    {
+        UpdateControls();
+        System::Delay(1);
+    }
+}
