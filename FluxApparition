@@ -1,19 +1,15 @@
 // ============================================================
-// FLUX APPARITION — v8R3 "K3 Law Refinement"
-// 
+// FLUX APPARITION — v8R4 "SW4 Character / Transient Cleanup"
+//
 // WHAT CHANGED IN THIS PASS
-// - Keeps the successful Tricera-style chorus from v8T2
-// - Reverb only:
-//   - lowers the reverb floor at minimum K3
-//   - keeps mid K3 usable and plate-like
-//   - trims the top end slightly so max is still rich but less excessive
-//   - keeps the improved glue to dry signal
-//   - adds decay-dependent diffusion: tighter at low K3, smoother at high K3
-//   - SW4 is pushed a bit more toward character than pure size
-//   - SW4 smoothing slowed further to reduce switching transient
-// - Chorus unchanged
-// - Freeze unchanged
-// - Switching unchanged
+// - Keeps chorus unchanged
+// - Keeps K3 law unchanged from v8R3 (because it tested well)
+// - Focuses only on SW4:
+//   - greatly reduces SW4 tap morph so it feels less like room-size
+//   - removes SW4 bias from diffusion coefficient changes
+//   - shifts SW4 character more through voicing/body-vs-late balance
+//   - adds SW4-dependent late smear voicing
+//   - slows SW4 smoothing further to reduce residual transient
 //
 // K1 Rate      Chorus LFO (0.1 - 3 Hz)
 // K2 Mix       Dry/wet crossfade
@@ -436,13 +432,13 @@ static inline void processChorus(float input, float modDepth,
 }
 
 // ============================================================
-// REVERB ENGINE (K3 LAW REFINEMENT)
+// REVERB ENGINE (SW4 CHARACTER / TRANSIENT CLEANUP)
 // ============================================================
 static inline void processReverb(float input, float &outL, float &outR)
 {
     float decayNorm = smoothstep01((sDecay - 0.30f) / (0.88f - 0.30f));
 
-    // Lower floor, still rewarding top.
+    // Keep successful K3 law from v8R3.
     float fbCoeff = 0.34f + decayNorm * 0.56f;
     fbCoeff = clampf(fbCoeff, 0.34f, 0.90f);
 
@@ -454,8 +450,9 @@ static inline void processReverb(float input, float &outL, float &outR)
     tankIn = inDiff[2].Process(tankIn);
     tankIn = inDiff[3].Process(tankIn);
 
-    // SW4 should feel more like voicing than pure size.
-    float sw4TapAmt = sSw4 * 0.60f;
+    // Greatly reduced tap morph:
+    // SW4 should read less like size and more like character.
+    float sw4TapAmt = sSw4 * 0.14f;
 
     float taps[4];
     for(int t = 0; t < 4; t++)
@@ -486,9 +483,16 @@ static inline void processReverb(float input, float &outL, float &outR)
         rvDel[t].Write(tankIn * inGain * 0.24f + fb);
     }
 
-    // Lower floor, richer mid, slightly trimmed ceiling.
-    float bodyGain = 0.20f + decayNorm * 0.16f;
-    float lateGain = 0.06f + decayNorm * 0.24f;
+    // Keep successful K3 range, but let SW4 act more like voicing:
+    // OFF = stronger body / tighter plate
+    // ON  = slightly less body / more late field / hall feel
+    float bodyGain = 0.20f + decayNorm * 0.16f
+                   + (1.f - sSw4) * 0.030f
+                   - sSw4 * 0.010f;
+
+    float lateGain = 0.06f + decayNorm * 0.24f
+                   - (1.f - sSw4) * 0.020f
+                   + sSw4 * 0.045f;
 
     float bodyL = (rd[0] + rd[2]) * bodyGain;
     float bodyR = (rd[1] + rd[3]) * bodyGain;
@@ -520,8 +524,8 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         fonepole(sSw2,   tSw2,   0.002f);
         fonepole(sSw3,   tSw3,   0.002f);
 
-        // Slower SW4 smoothing to reduce transient further.
-        fonepole(sSw4,   tSw4,   0.0015f);
+        // Slower still: target SW4 transient cleanup.
+        fonepole(sSw4,   tSw4,   0.0008f);
 
         fonepole(sChOn,  tChOn,  0.002f);
         fonepole(sRvOn,  tRvOn,  0.002f);
@@ -626,23 +630,29 @@ static void UpdateControls()
     toneSvfL.SetFreq(tTone, 1.4f, SR_F);
     toneSvfR.SetFreq(tTone, 1.4f, SR_F);
 
-    // Decay-dependent diffusion:
-    // lower K3 = less dense / snappier
-    // higher K3 = smoother / more plate-like
+    // Keep decay-dependent diffusion, but remove SW4 bias here
+    // to reduce character-switch transient.
     float decayNormCtrl = smoothstep01((tDecay - 0.30f) / (0.88f - 0.30f));
-    float diffBase = 0.52f + decayNormCtrl * 0.10f + tSw4 * 0.03f;
-    diffBase = clampf(diffBase, 0.50f, 0.68f);
+    float diffBase = 0.52f + decayNormCtrl * 0.10f;
+    diffBase = clampf(diffBase, 0.50f, 0.66f);
 
     inDiff[0].g = diffBase + 0.02f;
     inDiff[1].g = diffBase + 0.00f;
     inDiff[2].g = diffBase - 0.03f;
     inDiff[3].g = diffBase - 0.05f;
 
-    float dampOff  = PLATE_DAMP_OFFSET + sSw4 * (HALL_DAMP_OFFSET - PLATE_DAMP_OFFSET);
+    float dampOff  = PLATE_DAMP_OFFSET + tSw4 * (HALL_DAMP_OFFSET - PLATE_DAMP_OFFSET);
     float dampXmod = driftVal * XMOD_DAMP_RANGE;
     float dampFreq = std::max(300.f, std::min(5000.f + dampOff + dampXmod, 14000.f));
     for(int t = 0; t < 4; t++)
         rvDamp[t].SetFreq(dampFreq, SR_F);
+
+    // SW4 late-field voicing:
+    // OFF brighter/tighter
+    // ON darker/smoother
+    float smearFreq = 3000.f + tSw4 * (1800.f - 3000.f);
+    revLateSmearL.SetFreq(smearFreq, SR_F);
+    revLateSmearR.SetFreq(smearFreq, SR_F);
 
     tSw1 = petal.switches[Terrarium::SWITCH_1].Pressed() ? 1.f : 0.f;
     tSw2 = petal.switches[Terrarium::SWITCH_2].Pressed() ? 1.f : 0.f;
@@ -735,8 +745,8 @@ int main()
 
     shimmer.Init(shimBuf, SHIM_BUF_SIZE);
     shimLpf.Init(6000.f, sr);
-    revLateSmearL.Init(2400.f, sr);
-    revLateSmearR.Init(2400.f, sr);
+    revLateSmearL.Init(3000.f, sr);
+    revLateSmearR.Init(3000.f, sr);
 
     apL[0].Init(apMemL1, AP_L1, 0.6f);
     apL[1].Init(apMemL2, AP_L2, 0.6f);
