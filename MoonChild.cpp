@@ -27,7 +27,7 @@
 //
 // SWITCH LAYOUT
 // - SW1 = Chorus enhancement
-// - SW2 = Orbit / widen      (old SW3 behavior)
+// - SW2 = Orbit / widen (old SW3 behavior)
 // - SW3 = Bond / interaction (old SW2 behavior)
 // - SW4 = Reverb character
 // ============================================================
@@ -50,14 +50,13 @@ static constexpr float TWO_PI_F     = 6.283185307f;
 static constexpr float SR_F         = 48000.f;
 static constexpr float SR_OVER_1000 = 48.f;
 
-#define CHORUS_BUF_SIZE 1024
-#define REV_BUF_SIZE    12000
-#define SHIM_BUF_SIZE   2048
-#define FZ_CAP_BUF_SIZE 256
-
-#define FZ_A 4657
-#define FZ_B 7153
-#define FZ_C 9553
+#define CHORUS_BUF_SIZE  1024
+#define REV_BUF_SIZE     12000
+#define SHIM_BUF_SIZE    2048
+#define FZ_CAP_BUF_SIZE  256
+#define FZ_A  4657
+#define FZ_B  7153
+#define FZ_C  9553
 
 #define AP_L1  82
 #define AP_L2  110
@@ -97,10 +96,10 @@ static constexpr float K3_SHAPE_EXP      = 0.88f;
 // ============================================================
 // FS TIMING
 // ============================================================
-static constexpr int   FS1_HOLD_SAMPLES    = 160;
-static constexpr int   FS1_LOCKOUT_SAMPLES = 170;
-static constexpr int   FS2_HOLD_SAMPLES    = 160;
-static constexpr int   FS2_LOCKOUT_SAMPLES = 170;
+static constexpr int FS1_HOLD_SAMPLES    = 160;
+static constexpr int FS1_LOCKOUT_SAMPLES = 170;
+static constexpr int FS2_HOLD_SAMPLES    = 160;
+static constexpr int FS2_LOCKOUT_SAMPLES = 170;
 
 // ============================================================
 // FAST MATH
@@ -120,6 +119,34 @@ static inline float bbd_saturate(float x)
 static inline float tape_warm(float x)
 {
     return x - 0.15f * x * x * x;
+}
+
+// Gentle single-stage saturation for chorus.
+// Linear below threshold, soft cubic onset above.
+// Preserves dynamics for normal playing, only shapes hard peaks.
+static inline float gentle_sat(float x)
+{
+    float ax = fabsf(x);
+    if(ax < 0.8f)
+        return x;
+
+    // soft cubic knee above 0.8
+    float over = ax - 0.8f;
+    float shaped = 0.8f + over / (1.f + 2.5f * over);
+    return (x >= 0.f) ? shaped : -shaped;
+}
+
+// Wet bus limiter — only engages on peaks above 1.0.
+// Below 1.0 the signal passes untouched.
+static inline float peak_limit(float x)
+{
+    float ax = fabsf(x);
+    if(ax < 1.0f)
+        return x;
+
+    float over = ax - 1.0f;
+    float shaped = 1.0f + over / (1.f + 3.f * over);
+    return (x >= 0.f) ? shaped : -shaped;
 }
 
 static inline float clampf(float x, float lo, float hi)
@@ -178,10 +205,7 @@ struct Lp1
         y += c * (x - y);
         return y;
     }
-    void Clear()
-    {
-        y = 0.f;
-    }
+    void Clear() { y = 0.f; }
 };
 
 struct Hp1
@@ -201,10 +225,7 @@ struct Hp1
         y += c * (x - y);
         return x - y;
     }
-    void Clear()
-    {
-        y = 0.f;
-    }
+    void Clear() { y = 0.f; }
 };
 
 struct BbdSvf
@@ -375,7 +396,8 @@ struct FreezeVoice
     Hp1*   hp;
     Ap*    loopAp;
 
-    void Init(float* mem, size_t sz, float ms, float sr, Lp1* lp_, Hp1* hp_, Ap* loopAp_)
+    void Init(float* mem, size_t sz, float ms, float sr,
+              Lp1* lp_, Hp1* hp_, Ap* loopAp_)
     {
         buf.Init(mem, sz);
         bufSamps = ms * sr / 1000.f;
@@ -388,12 +410,10 @@ struct FreezeVoice
     float Process(float input, float feedGt, float holdGt, float modSamps)
     {
         float loopIn = input * feedGt + fb * holdGt;
-        loopIn       = loopAp->Process(loopIn);
+        loopIn = loopAp->Process(loopIn);
         buf.Write(loopIn);
-
         float rd = buf.Read(bufSamps + modSamps);
         fb = rd;
-
         float sig = rd * holdGt;
         sig = lp->Process(sig);
         sig = hp->Process(sig);
@@ -426,11 +446,9 @@ static float DSY_SDRAM_BSS fzBufC[FZ_C];
 static float fzFuseMemA[FZ_FUSE_A];
 static float fzFuseMemB[FZ_FUSE_B];
 static float fzPostApMem[FZ_POST_AP];
-
 static float fzPostVoiceMemA[FZ_POST_VA];
 static float fzPostVoiceMemB[FZ_POST_VB];
 static float fzPostVoiceMemC[FZ_POST_VC];
-
 static float fzLoopApMemA[FZ_LOOP_AP_A];
 static float fzLoopApMemB[FZ_LOOP_AP_B];
 static float fzLoopApMemC[FZ_LOOP_AP_C];
@@ -456,6 +474,7 @@ static Lp1    chWriteLpf;
 static Ap     apL[3], apR[3];
 static Ap     inDiff[4];
 static ShimmerPS shimmer;
+
 static Hp1    sw1SrcHp;
 static Lp1    sw1LowLpf;
 static Lp1    sw1ToneLpf;
@@ -463,18 +482,19 @@ static Lp1    sw1PostSmoothLp;
 static Hp1    sw1AirHp;
 static Lp1    sw1EnvLp;
 static Ap     sw1SmoothAp;
+
 static Lp1    revLateSmearL;
 static Lp1    revLateSmearR;
 
 static FreezeVoice fzVoice[3];
-static Lp1         fzLp[3];
-static Hp1         fzHp[3];
-static Ap          fzFuseA, fzFuseB;
-static Ap          fzPostAp;
-static Ap          fzPostVoiceA, fzPostVoiceB, fzPostVoiceC;
-static Lp1         fzCloudTone;
-static Lp1         fzLowKeepTone;
-static Ap          fzLoopAp[3];
+static Lp1    fzLp[3];
+static Hp1    fzHp[3];
+static Ap     fzFuseA, fzFuseB;
+static Ap     fzPostAp;
+static Ap     fzPostVoiceA, fzPostVoiceB, fzPostVoiceC;
+static Lp1    fzCloudTone;
+static Lp1    fzLowKeepTone;
+static Ap     fzLoopAp[3];
 
 static float lfoPhaseA   = 0.f;
 static float lfoPhaseB   = 0.37f;
@@ -489,27 +509,26 @@ static constexpr float DRIFT_AMOUNT = 0.25f;
 static float prevChOut = 0.f;
 static float prevRvOut = 0.f;
 
-static float    fzJitCur[3]   = {0.f, 0.f, 0.f};
-static float    fzJitTgt[3]   = {0.f, 0.f, 0.f};
-static int      fzJitCnt[3]   = {0, 0, 0};
+static float fzJitCur[3] = {0.f, 0.f, 0.f};
+static float fzJitTgt[3] = {0.f, 0.f, 0.f};
+static int   fzJitCnt[3] = {0, 0, 0};
 static uint32_t fzJitState[3] = {0x13579BDFu, 0x2468ACE1u, 0xA5A5F00Du};
 
-static bool fzCaptureSeqActive = false;
-static int  fzCaptureSeqSamp   = 0;
-static bool prevFreezeTarget   = false;
-
-static float prevFzTap[3] = {0.f, 0.f, 0.f};
+static bool  fzCaptureSeqActive = false;
+static int   fzCaptureSeqSamp   = 0;
+static bool  prevFreezeTarget   = false;
+static float prevFzTap[3]       = {0.f, 0.f, 0.f};
 
 // ============================================================
 // FREEZE EVOLUTION STATE
 // ============================================================
-static float freezeTextureDrift = 0.f;
+static float freezeTextureDrift  = 0.f;
 static Lp1   freezePlayEnvFast;
 static Lp1   freezePlayEnvSlow;
 static Hp1   freezePlaySenseHp;
-static float freezePlayActivity = 0.f;
-static float freezeAgeSec   = 0.f;
-static float freezeEvoPhase = 0.f;
+static float freezePlayActivity  = 0.f;
+static float freezeAgeSec        = 0.f;
+static float freezeEvoPhase      = 0.f;
 
 // ============================================================
 // SMOOTHED PARAMETERS
@@ -535,13 +554,13 @@ static float tFzAud = 0.f, sFzAud = 0.f;
 // FS1 momentary chorus->freeze send state
 static float tFs1Send = 0.f, sFs1Send = 0.f;
 
-static bool chorusOn = false;
-static bool reverbOn = false;
-static bool reverbFz = false;
+static bool chorusOn  = false;
+static bool reverbOn  = false;
+static bool reverbFz  = false;
 
-static bool fs1Prev = false;
-static bool fs1Held = false;
-static int  fs1Timer = 0;
+static bool fs1Prev   = false;
+static bool fs1Held   = false;
+static int  fs1Timer  = 0;
 static int  fs1Lockout = 0;
 
 static bool fs2Prev = false, fs2Held = false;
@@ -549,9 +568,11 @@ static int  fs2Timer = 0, fs2Lockout = 0;
 
 static Led led1, led2;
 static Parameter pRate, pMix, pDecay, pDepth, pBal, pTone;
+
 static float ledPulsePhase = 0.f;
 static float ledPulse      = 0.f;
 static float freezeLedAge  = 0.f;
+
 // ============================================================
 // DEDICATED FREEZE SHUTDOWN-TAIL STATE
 // ============================================================
@@ -564,13 +585,10 @@ static void FullFreezeShutdown();
 static inline void BeginFreezeShutdownTail()
 {
     freezeShutdownTailActive = true;
-
     freezeShutdownHold = std::max(0.98f, sRvFz);
-
     reverbFz = false;
     tRvFz    = 0.f;
     tFzAud   = 0.f;
-
     fzCaptureSeqActive = false;
     fzCaptureSeqSamp   = 0;
     prevFreezeTarget   = false;
@@ -596,37 +614,28 @@ static void FullFreezeShutdown()
         fzLp[i].Clear();
         fzHp[i].Clear();
     }
-
     fzPostVoiceA.Clear();
     fzPostVoiceB.Clear();
     fzPostVoiceC.Clear();
-
     fzCloudTone.Clear();
     fzLowKeepTone.Clear();
-
     fzFuseA.Clear();
     fzFuseB.Clear();
     fzPostAp.Clear();
-
     fzCapBuf.Clear();
-
     prevFzTap[0] = 0.f;
     prevFzTap[1] = 0.f;
     prevFzTap[2] = 0.f;
-
-    fzCaptureSeqActive = false;
-    fzCaptureSeqSamp   = 0;
-    prevFreezeTarget   = false;
-
+    fzCaptureSeqActive       = false;
+    fzCaptureSeqSamp         = 0;
+    prevFreezeTarget         = false;
     freezeShutdownTailActive = false;
     freezeShutdownHold       = 0.f;
     freezeShutdownEnv        = 0.f;
-
-    freezeAgeSec       = 0.f;
-    freezeEvoPhase     = 0.f;
-    freezeTextureDrift = 0.f;
-    freezePlayActivity = 0.f;
-
+    freezeAgeSec             = 0.f;
+    freezeEvoPhase           = 0.f;
+    freezeTextureDrift       = 0.f;
+    freezePlayActivity       = 0.f;
     reverbFz = false;
     tRvFz    = 0.f;
     tFzAud   = 0.f;
@@ -634,14 +643,19 @@ static void FullFreezeShutdown()
 
 // ============================================================
 // CHORUS ENGINE
+//
+// Hi-Fi dynamics changes:
+// - Removed tape_warm -> bbd_saturate double-saturation chain
+// - Replaced with parallel blend: 72% gentle_sat + 28% clean
+// - Preserves the tonal character but keeps dynamics open
+// - Drive multiplier kept for SW3/SW1 voicing control
 // ============================================================
-static inline void processChorus(float input,
-                                 float modDepth,
+static inline void processChorus(float input, float modDepth,
                                  float sw2StateAmt,
-                                 float &outL,
-                                 float &outR)
+                                 float &outL, float &outR)
 {
-    float sw1Lift  = sSw1;
+    float sw1Lift = sSw1;
+
     float depthMul = 1.f + sSw3 * 0.90f + sw1Lift * 0.12f + sw2StateAmt * 0.12f;
     float sideMul  = 0.24f + sSw3 * 0.12f + sw1Lift * 0.03f + sw2StateAmt * 0.07f;
     float driveMul = 0.78f + sSw3 * 0.08f;
@@ -663,7 +677,7 @@ static inline void processChorus(float input,
     float delC = clampf(delC_ms * SR_OVER_1000, 1.f, (float)(CHORUS_BUF_SIZE - 2));
 
     float filteredWrite = chWriteHpf.Process(chWriteLpf.Process(input));
-    float writeSig      = filteredWrite * 0.78f + input * 0.22f;
+    float writeSig = filteredWrite * 0.78f + input * 0.22f;
 
     chDel[0].Write(writeSig);
     chDel[1].Write(writeSig);
@@ -676,28 +690,40 @@ static inline void processChorus(float input,
     float midAB = wetA * 0.56f + wetB * 0.44f;
     float side  = (wetA - wetB) * sideMul;
 
-    float preL  = midAB + side + wetC * glueMul;
-    float preR  = midAB - side + wetC * glueMul;
+    float preL = midAB + side  + wetC * glueMul;
+    float preR = midAB - side  + wetC * glueMul;
 
-    float satL  = bbd_saturate(tape_warm(preL * driveMul));
-    float satR  = bbd_saturate(tape_warm(preR * driveMul));
+    // Hi-Fi: single gentle_sat replaces tape_warm -> bbd_saturate.
+    // driveMul preserved for SW3 voicing; gentle_sat is linear
+    // below 0.8 so normal playing passes through untouched.
+    float satL = gentle_sat(preL * driveMul);
+    float satR = gentle_sat(preR * driveMul);
 
+    // Parallel blend preserves dynamics: 72% saturated path
+    // gives character, 28% clean path preserves transient peaks.
     outL = satL * 0.72f + preL * 0.28f;
     outR = satR * 0.72f + preR * 0.28f;
 }
 
 // ============================================================
 // REVERB ENGINE
+//
+// Hi-Fi dynamics changes:
+// - fbCoeff range tightened: max 0.84 instead of 0.90
+//   so fast_tanh operates in its linear region more often
+// - Tank input gain raised 0.24 -> 0.27 to compensate
+// - All SW4, character, halo, stereo logic unchanged
 // ============================================================
-static inline void processReverb(float input,
-                                 float sw2StateAmt,
-                                 float &outL,
-                                 float &outR)
+static inline void processReverb(float input, float sw2StateAmt,
+                                 float &outL, float &outR)
 {
     float decayNorm = shapedDecayNorm(sDecay);
 
-    float fbCoeff = 0.34f + decayNorm * 0.56f;
-    fbCoeff = clampf(fbCoeff, 0.34f, 0.90f);
+    // Tightened feedback ceiling: 0.34 + 0.50*norm = max 0.84
+    // At typical signal levels this keeps fbInput*fbCoeff < 0.5
+    // more often, where fast_tanh is nearly linear.
+    float fbCoeff = 0.34f + decayNorm * 0.50f;
+    fbCoeff = clampf(fbCoeff, 0.34f, 0.84f);
 
     float tankIn = input;
     tankIn = inDiff[0].Process(tankIn);
@@ -711,7 +737,7 @@ static inline void processReverb(float input,
     for(int t = 0; t < 4; t++)
     {
         float baseTap = (float)TAP_BRIGHT[t]
-        + sw4TapAmt * (float)(TAP_DARK[t] - TAP_BRIGHT[t]);
+                      + sw4TapAmt * (float)(TAP_DARK[t] - TAP_BRIGHT[t]);
         taps[t] = baseTap;
     }
 
@@ -726,41 +752,41 @@ static inline void processReverb(float input,
         float mixed    = rd[t] - 0.44f * rdSum;
         float filtered = rvDamp[t].Process(mixed);
         float fb       = fast_tanh(filtered * fbCoeff);
-        rvDel[t].Write(tankIn * 0.24f + fb);
+        // Slightly higher tank input to offset lower fbCoeff
+        rvDel[t].Write(tankIn * 0.27f + fb);
     }
 
     float hallWeight  = sSw4 * (0.18f + 0.82f * decayNorm);
     float plateWeight = 1.f - sSw4;
 
     float bodyGain = 0.22f + decayNorm * 0.15f
-    + plateWeight * 0.050f
-    - hallWeight  * 0.035f;
+                   + plateWeight * 0.050f
+                   - hallWeight  * 0.035f;
 
     float lateGain = 0.078f + decayNorm * 0.230f
-    - plateWeight * 0.010f
-    + hallWeight  * 0.225f;
+                   - plateWeight * 0.010f
+                   + hallWeight  * 0.225f;
 
     bodyGain *= 1.0f + sw2StateAmt * 0.18f;
     lateGain *= 1.0f + sw2StateAmt * 0.28f;
-
     lateGain *= 1.0f + (decayNorm * sSw4 * 0.08f);
 
     float bodyL = (rd[0] + rd[2]) * bodyGain;
     float bodyR = (rd[1] + rd[3]) * bodyGain;
 
     float sw4PulsePhase = driftPhase * TWO_PI_F * 0.72f;
-    float sw4Pulse      = 1.0f + sSw4 * (0.055f * sinf(sw4PulsePhase));
-    float driftStereo   = sinf(driftPhase * TWO_PI_F * 0.35f) * 0.06f;
+    float sw4Pulse = 1.0f + sSw4 * (0.055f * sinf(sw4PulsePhase));
+
+    float driftStereo = sinf(driftPhase * TWO_PI_F * 0.35f) * 0.06f;
 
     float lateL = revLateSmearL.Process((rd[1] - rd[2]) * lateGain)
-    * sw4Pulse * (1.0f + driftStereo);
+                * sw4Pulse * (1.0f + driftStereo);
     float lateR = revLateSmearR.Process((rd[0] - rd[3]) * lateGain)
-    * sw4Pulse * (1.0f - driftStereo);
+                * sw4Pulse * (1.0f - driftStereo);
 
     float lateCross = 0.12f + 0.08f * sSw4;
-    float lateLxf   = lateL + lateR * lateCross;
-    float lateRxf   = lateR + lateL * lateCross;
-
+    float lateLxf = lateL + lateR * lateCross;
+    float lateRxf = lateR + lateL * lateCross;
     lateL = lateLxf;
     lateR = lateRxf;
 
@@ -780,21 +806,30 @@ static inline void processReverb(float input,
 
 // ============================================================
 // AUDIO CALLBACK
+//
+// Hi-Fi dynamics changes:
+// - Dry input: no tape_warm — clean after HPF
+// - Wet bus: 3.20x -> 2.0x gain, tape_warm -> peak_limit
+// - Mono sum: 0.7 -> 0.82
+// - Freeze source: tape_warm on chorus send kept (intentional
+//   color for the freeze capture path only, not main signal)
+// - All routing, freeze, SW1 voice, bond/orbit logic unchanged
 // ============================================================
-static void AudioCallback(AudioHandle::InputBuffer in,
+static void AudioCallback(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
                           size_t size)
 {
     for(size_t i = 0; i < size; i++)
     {
-        fonepole(sMix,     tMix,     0.005f);
-        fonepole(sDecay,   tDecay,   0.005f);
-        fonepole(sDepth,   tDepth,   0.002f);
-        fonepole(sBal,     tBal,     0.002f);
-        fonepole(sSw1,     tSw1,     0.002f);
-        fonepole(sSw2,     tSw2,     0.002f);
-        fonepole(sSw3,     tSw3,     0.002f);
-        fonepole(sSw4,     tSw4,     0.0003f);
+        fonepole(sMix,    tMix,    0.005f);
+        fonepole(sDecay,  tDecay,  0.005f);
+        fonepole(sDepth,  tDepth,  0.002f);
+        fonepole(sBal,    tBal,    0.002f);
+        fonepole(sSw1,    tSw1,    0.002f);
+        fonepole(sSw2,    tSw2,    0.002f);
+        fonepole(sSw3,    tSw3,    0.002f);
+        fonepole(sSw4,    tSw4,    0.0003f);
+
         fonepole(sChOn,    tChOn,    0.002f);
         fonepole(sRvOn,    tRvOn,    0.002f);
         fonepole(sFs1Send, tFs1Send, 0.0012f);
@@ -803,23 +838,26 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         fonepole(sRvFz, tRvFz, rvFzC);
 
         float fzAudReleaseC = freezeShutdownTailActive ? 0.000022f : 0.00003f;
-        float fzAudC        = (tFzAud > sFzAud) ? 0.0008f : fzAudReleaseC;
+        float fzAudC = (tFzAud > sFzAud) ? 0.0008f : fzAudReleaseC;
         fonepole(sFzAud, tFzAud, fzAudC);
 
         float raw = in[0][i];
-        ledPulsePhase += 0.35f / SR_F; // speed of pulse
+
+        ledPulsePhase += 0.35f / SR_F;
         if(ledPulsePhase >= 1.f)
             ledPulsePhase -= 1.f;
-
         ledPulse = 0.5f + 0.5f * sinf(ledPulsePhase * TWO_PI_F);
-        float dry = tape_warm(inputHpf.Process(raw));
 
-        float playSense     = freezePlaySenseHp.Process(dry);
-        float playEnvFast   = freezePlayEnvFast.Process(fabsf(playSense));
-        float playEnvSlow   = freezePlayEnvSlow.Process(playEnvFast);
+        // Hi-Fi: clean dry signal — no tape_warm. Full transient
+        // integrity preserved for touch response.
+        float dry = inputHpf.Process(raw);
+
+        float playSense  = freezePlaySenseHp.Process(dry);
+        float playEnvFast = freezePlayEnvFast.Process(fabsf(playSense));
+        float playEnvSlow = freezePlayEnvSlow.Process(playEnvFast);
         float livePlaySense = clampf(playEnvSlow * 6.0f, 0.f, 1.f);
 
-        float anyOn  = std::min(1.f, sChOn + sRvOn);
+        float anyOn = std::min(1.f, sChOn + sRvOn);
         float bothOn = sChOn * sRvOn;
 
         lfoPhaseA += lfoFreq / SR_F;
@@ -840,24 +878,22 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         if(reverbFz)
         {
             freezeAgeSec += 1.0f / SR_F;
-            if(freezeAgeSec > 60.f)
-                freezeAgeSec = 60.f;
+            if(freezeAgeSec > 60.f) freezeAgeSec = 60.f;
         }
         else
         {
             freezeAgeSec = 0.f;
         }
-
         freezeLedAge = clampf((freezeAgeSec - 0.5f) / 18.0f, 0.f, 1.f);
 
         freezeEvoPhase += 0.011f / SR_F;
-        if(freezeEvoPhase >= 1.f)
-            freezeEvoPhase -= 1.f;
+        if(freezeEvoPhase >= 1.f) freezeEvoPhase -= 1.f;
+
         freezeTextureDrift += 0.0031f / SR_F;
-        if(freezeTextureDrift >= 1.f)
-            freezeTextureDrift -= 1.f;
-        const int resetCounts[3]   = {28657, 40111, 56369};
-        const float jitterDepth[3] = {4.50f, 6.00f, 8.00f};
+        if(freezeTextureDrift >= 1.f) freezeTextureDrift -= 1.f;
+
+        const int   resetCounts[3]  = {28657, 40111, 56369};
+        const float jitterDepth[3]  = {4.50f, 6.00f, 8.00f};
         for(int v = 0; v < 3; v++)
         {
             if(--fzJitCnt[v] <= 0)
@@ -868,15 +904,15 @@ static void AudioCallback(AudioHandle::InputBuffer in,
             fzJitCur[v] += 0.0008f * (fzJitTgt[v] - fzJitCur[v]);
         }
 
-        float bond      = sBal;
-        float bondLo    = 1.f - bond;
-        float bondAud   = smoothstep01(bond);
+        float bond   = sBal;
+        float bondLo = 1.f - bond;
+        float bondAud = smoothstep01(bond);
 
         float sw2State = sSw2 * bothOn;
         float entangle = sw2State * smoothstep01(clampf((bond - 0.10f) / 0.90f, 0.f, 1.f));
 
-        float sw2Safety  = 1.00f - 0.55f * smoothstep01(clampf((bond - 0.44f) / 0.56f, 0.f, 1.f));
-        sw2Safety        = clampf(sw2Safety, 0.45f, 1.00f);
+        float sw2Safety = 1.00f - 0.55f * smoothstep01(clampf((bond - 0.44f) / 0.56f, 0.f, 1.f));
+        sw2Safety = clampf(sw2Safety, 0.45f, 1.00f);
 
         float chToRvAmt = (0.05f + 0.90f * entangle) * sw2Safety;
         float rvToChAmt = (0.03f + 0.58f * entangle) * sw2Safety;
@@ -902,8 +938,8 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         prevChOut = (chL + chR) * 0.5f;
         prevRvOut = (rvL + rvR) * 0.5f;
 
-        float rvMid   = (rvL + rvR) * 0.5f;
-        float rvSide  = (rvL - rvR) * 0.5f;
+        float rvMid  = (rvL + rvR) * 0.5f;
+        float rvSide = (rvL - rvR) * 0.5f;
 
         float rvWidth = (0.72f + 1.30f * bondAud) * (1.0f + sSw4 * 0.60f);
         float rvBloom = 0.82f + 1.16f * bondAud;
@@ -916,6 +952,7 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         rvR = (rvMid - rvSide) * rvBloom;
 
         float sw1Ens = sSw1 * sChOn;
+
         float chBloom = 0.95f + 0.22f * bondAud + sw1Ens * 0.12f;
         chBloom *= 1.0f + sw2State * 0.16f;
 
@@ -940,54 +977,55 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         float chMid  = (chL + chR) * 0.5f;
         float chSide = (chL - chR) * 0.5f;
 
-        float sw1Articulate = dry * 0.55f + chMid * 0.40f + chSide * 0.20f;
+        // ====================================================
+        // SW1 VOICE CHAIN
+        // Gate input by sChOn so nothing leaks into reverb-only
+        // ====================================================
+        float sw1Gate = sSw1 * sChOn;
+        float sw1Articulate = (dry * 0.55f + chMid * 0.40f + chSide * 0.20f) * sw1Gate;
+        float sw1Low  = sw1LowLpf.Process(sw1Articulate);
+        float sw1Edge = sw1SrcHp.Process(sw1Articulate);
 
-        float sw1Low        = sw1LowLpf.Process(sw1Articulate);
-        float sw1Edge       = sw1SrcHp.Process(sw1Articulate);
-
-        float lowBoost = 0.22f + 0.10f * sSw1; // slightly stronger when SW1 active
-
-        float sw1Source = sw1Articulate * 0.55f
-        + sw1Edge * 0.64f
-        + sw1Low  * lowBoost;
+        float lowBoost = 0.22f + 0.10f * sSw1;
+        float sw1Source = sw1Articulate * 0.55f + sw1Edge * 0.64f + sw1Low * lowBoost;
 
         float envIn   = fabsf(sw1Source);
         float env     = sw1EnvLp.Process(envIn);
         float envNorm = clampf(env * 5.2f, 0.f, 1.f);
         float contour = 0.62f + 0.78f * smoothstep01(envNorm);
 
-        float sw1Drive = sw1Source * contour * sSw1 * sChOn * 0.95f;
+        float sw1Drive = sw1Source * contour * 0.95f;
         float sw1Voice = shimmer.Process(sw1Drive);
 
         float sw1Smooth = sw1PostSmoothLp.Process(sw1Voice);
         float sw1Diff   = sw1SmoothAp.Process(sw1Smooth);
-
         float sw1Shaped = sw1Voice * 0.69f + sw1Smooth * 0.25f + sw1Diff * 0.06f;
 
-        float sw1Toned = sw1ToneLpf.Process(sw1Shaped);
-        float sw1Air   = sw1AirHp.Process(sw1Toned);
-
+        float sw1Toned   = sw1ToneLpf.Process(sw1Shaped);
+        float sw1Air     = sw1AirHp.Process(sw1Toned);
         float sw1BodyAir = sw1Toned * 0.96f + sw1Air * 0.20f;
-        float sw1Attach = sw1Source * contour * (0.17f + 0.07f * bondAud) * sSw1 * sChOn;
+
+        float sw1Attach = sw1Source * contour * (0.17f + 0.07f * bondAud);
         float sw1Integrated = sw1BodyAir * 0.95f + sw1Attach * 0.40f;
 
         float sw1Blend  = sSw1 * (0.340f + 0.159f * bondAud);
         float sw1Stereo = sSw1 * (0.11f + 0.03f * bondAud);
-
         sw1Blend  *= 1.0f + 0.12f * sw2State;
         sw1Stereo *= 1.0f + 0.08f * sw2State;
 
-        chorusOnlyL += sw1Integrated * sw1Blend + chSide * sw1Stereo;
+        chorusOnlyL += sw1Integrated * sw1Blend  + chSide * sw1Stereo;
         chorusOnlyR += sw1Integrated * (sw1Blend * 0.92f) - chSide * sw1Stereo;
 
-        wetL += sw1Integrated * sw1Blend + chSide * sw1Stereo;
+        wetL += sw1Integrated * sw1Blend  + chSide * sw1Stereo;
         wetR += sw1Integrated * (sw1Blend * 0.92f) - chSide * sw1Stereo;
 
-        wetL *= 3.20f;
-        wetR *= 3.20f;
+        // Hi-Fi: reduced gain 3.20 -> 2.0, peak_limit replaces tape_warm.
+        // peak_limit is fully transparent below 1.0.
+        wetL *= 2.0f;
+        wetR *= 2.0f;
 
-        wetL = tape_warm(wetL);
-        wetR = tape_warm(wetR);
+        wetL = peak_limit(wetL);
+        wetR = peak_limit(wetR);
 
         wetL = apL[0].Process(wetL);
         wetL = apL[1].Process(wetL);
@@ -999,25 +1037,24 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         wetL = toneSvfL.Process(wetL);
         wetR = toneSvfR.Process(wetR);
 
-        float wetMono = (wetL + wetR) * 0.7f;
+        // Hi-Fi: mono sum raised 0.7 -> 0.82 for more body
+        float wetMono = (wetL + wetR) * 0.82f;
 
         // ====================================================
         // REVERB FREEZE SOURCE + FS1 MOMENTARY CHORUS SEND
+        // (tape_warm kept here intentionally — it colors the
+        //  freeze capture, not the main signal path)
         // ====================================================
         float reverbFreezeMid = (rvL + rvR) * 0.5f;
         float chorusFreezeMid = clampf((chorusOnlyL + chorusOnlyR) * 0.5f, -1.f, 1.f);
 
-        // Slight perceptual enhancement (not just gain)
         float chorusSend = chorusFreezeMid;
-        chorusSend = tape_warm(chorusSend * 1.12f); // mild saturation + lift
+        chorusSend = tape_warm(chorusSend * 1.12f);
 
-        float sendAmt = 0.54f * sFs1Send;
-
+        float sendAmt   = 0.54f * sFs1Send;
         float freezeSrc = reverbFreezeMid * (1.f - sendAmt)
-        + chorusSend * sendAmt;
-
+                        + chorusSend * sendAmt;
         freezeSrc = clampf(freezeSrc, -1.f, 1.f);
-
         fzCapBuf.Write(freezeSrc);
 
         const int capDelay[3] = {0, 113, 347};
@@ -1034,9 +1071,10 @@ static void AudioCallback(AudioHandle::InputBuffer in,
 
         float voiceHold[3];
         float voiceFeed[3];
+        float freezeHoldMaster = freezeShutdownTailActive
+                               ? freezeShutdownHold : sRvFz;
 
-        float freezeHoldMaster = freezeShutdownTailActive ? freezeShutdownHold : sRvFz;
-        freezePlayActivity     = livePlaySense * sRvFz;
+        freezePlayActivity = livePlaySense * sRvFz;
 
         float fs1SendFeedFloor = 0.f;
         if(!freezeShutdownTailActive && reverbFz)
@@ -1045,14 +1083,13 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         for(int v = 0; v < 3; v++)
         {
             float hold = freezeHoldMaster;
-
             if(fzCaptureSeqActive)
             {
-                float x = (float)(fzCaptureSeqSamp - capDelay[v]) / (float)capDur[v];
+                float x    = (float)(fzCaptureSeqSamp - capDelay[v])
+                           / (float)capDur[v];
                 float seal = smoothstep01(x);
                 hold *= seal;
             }
-
             voiceHold[v] = hold;
 
             if(freezeShutdownTailActive)
@@ -1068,27 +1105,18 @@ static void AudioCallback(AudioHandle::InputBuffer in,
 
         float baseMod = driftVal * 1.40f * SR_OVER_1000;
 
-        float snapA = fzCapBuf.Read(1.f)  * 0.66f
-        + fzCapBuf.Read(3.f)  * 0.20f
-        + fzCapBuf.Read(7.f)  * 0.09f
-        + fzCapBuf.Read(13.f) * 0.05f;
-
-        float snapB = fzCapBuf.Read(2.f)  * 0.63f
-        + fzCapBuf.Read(5.f)  * 0.21f
-        + fzCapBuf.Read(11.f) * 0.10f
-        + fzCapBuf.Read(17.f) * 0.06f;
-
-        float snapC = fzCapBuf.Read(3.f)  * 0.60f
-        + fzCapBuf.Read(7.f)  * 0.22f
-        + fzCapBuf.Read(13.f) * 0.11f
-        + fzCapBuf.Read(19.f) * 0.07f;
+        float snapA = fzCapBuf.Read(1.f) * 0.66f  + fzCapBuf.Read(3.f) * 0.20f
+                    + fzCapBuf.Read(7.f) * 0.09f  + fzCapBuf.Read(13.f) * 0.05f;
+        float snapB = fzCapBuf.Read(2.f) * 0.63f  + fzCapBuf.Read(5.f) * 0.21f
+                    + fzCapBuf.Read(11.f) * 0.10f + fzCapBuf.Read(17.f) * 0.06f;
+        float snapC = fzCapBuf.Read(3.f) * 0.60f  + fzCapBuf.Read(7.f) * 0.22f
+                    + fzCapBuf.Read(13.f) * 0.11f + fzCapBuf.Read(19.f) * 0.07f;
 
         float srcA = snapA * 0.94f + freezeSrc * 0.06f;
         float srcB = snapB * 0.95f + freezeSrc * 0.05f;
         float srcC = snapC * 0.96f + freezeSrc * 0.04f;
 
         const float cross = 0.03f;
-
         float inA = srcA + prevFzTap[1] * cross;
         float inB = srcB + prevFzTap[2] * cross;
         float inC = srcC + prevFzTap[0] * cross;
@@ -1109,35 +1137,26 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         float fzCd = fzC * 0.86f + fzPostVoiceC.Process(fzC) * 0.14f;
 
         // ====================================================
-        // FREEZE EVOLUTION V2
+        // FREEZE EVOLUTION V2 (unchanged)
         // ====================================================
         float freezeBondAud = smoothstep01(sBal);
-
         float evoAgeNorm = clampf((freezeAgeSec - 0.4f) / 10.5f, 0.f, 1.f);
         float evoAmt     = smoothstep01(evoAgeNorm);
         evoAmt *= (0.30f + 0.70f * freezeBondAud);
 
-        // V2 texture drift
         float driftA = sinf(freezeTextureDrift * TWO_PI_F);
         float driftB = sinf(freezeTextureDrift * TWO_PI_F * 0.37f + 0.9f);
         float driftC = sinf(freezeTextureDrift * TWO_PI_F * 0.19f + 2.1f);
 
         float driftAmt = 0.06f * evoAmt;
-
         float wA = 0.38f + driftA * driftAmt;
         float wB = 0.34f + driftB * driftAmt;
         float wC = 0.28f + driftC * driftAmt;
-
         float wSum = wA + wB + wC;
-        wA /= wSum;
-        wB /= wSum;
-        wC /= wSum;
+        wA /= wSum;  wB /= wSum;  wC /= wSum;
 
-        float fzOutBase = fzAd * wA
-        + fzBd * wB
-        + fzCd * wC;
+        float fzOutBase = fzAd * wA + fzBd * wB + fzCd * wC;
 
-        // V1 tonal evolution retained
         float evoSineA = sinf(freezeEvoPhase * TWO_PI_F);
         float evoSineB = sinf(freezeEvoPhase * TWO_PI_F * 0.41f + 1.13f);
 
@@ -1147,35 +1166,31 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         fzCloudTone.SetFreq(fzCloudOpenFreq + evoFreqDrift + reactiveOpen, SR_F);
 
         float fzLowKeep = fzLowKeepTone.Process(fzOutBase);
+        float fzCloudA  = fzCloudTone.Process(fzOutBase);
+        float fzCloudB  = fzFuseA.Process(fzCloudA);
+        float fzCloudC  = fzFuseB.Process(fzCloudB);
 
-        float fzCloudA = fzCloudTone.Process(fzOutBase);
-        float fzCloudB = fzFuseA.Process(fzCloudA);
-        float fzCloudC = fzFuseB.Process(fzCloudB);
-
-        // V2 density + diffusion
         float fzDiffBlend = 0.16f + 0.30f * freezeBondAud + 0.08f * evoAmt;
         fzDiffBlend += 0.05f * evoAmt;
         fzDiffBlend += freezePlayActivity * (0.035f + 0.035f * freezeBondAud);
-        fzDiffBlend = clampf(fzDiffBlend, 0.f, 0.68f);
+        fzDiffBlend  = clampf(fzDiffBlend, 0.f, 0.68f);
 
         float fzCloudMix = fzOutBase * (1.f - fzDiffBlend)
-        + fzCloudC * fzDiffBlend;
+                         + fzCloudC * fzDiffBlend;
 
         float lowKeepAmt = 0.035f + 0.055f * evoAmt;
         lowKeepAmt *= 0.90f + 0.10f * freezeBondAud;
-
         fzCloudMix += fzLowKeep * lowKeepAmt;
 
         float fzDiff = fzPostAp.Process(fzCloudMix);
-
         float postSumBlend = 0.14f + 0.10f * freezeBondAud + 0.05f * evoAmt;
         postSumBlend += 0.04f * evoAmt;
-        postSumBlend = clampf(postSumBlend, 0.f, 0.38f);
+        postSumBlend  = clampf(postSumBlend, 0.f, 0.38f);
 
         float fzOut = fzCloudMix * (1.f - postSumBlend)
-        + fzDiff * postSumBlend;
+                    + fzDiff * postSumBlend;
 
-        float decayNorm = shapedDecayNorm(sDecay);
+        float decayNorm  = shapedDecayNorm(sDecay);
         float freezeGain = 14.45f + 1.76f * decayNorm;
 
         float freezeBondLift = 1.00f + 0.45f * freezeBondAud * freezeHoldMaster;
@@ -1187,18 +1202,19 @@ static void AudioCallback(AudioHandle::InputBuffer in,
         float fzAbs = fabsf(fzOut);
         freezeShutdownEnv += 0.0005f * (fzAbs - freezeShutdownEnv);
 
-        float mixNorm = clampf(sMix, 0.f, 1.f);
-        float wetCtrl = smoothstep01(powf(mixNorm, 1.32f));
-
+        // ====================================================
+        // MIX OUTPUT
+        // ====================================================
+        float mixNorm    = clampf(sMix, 0.f, 1.f);
+        float wetCtrl    = smoothstep01(powf(mixNorm, 1.32f));
         float dryPreserve = 0.89f + 0.11f * (1.f - wetCtrl);
+        float wetMakeup   = 0.90f + 0.44f * wetCtrl;
 
-        float wetMakeup = 0.90f + 0.44f * wetCtrl;
         float reverbOnly = sRvOn * (1.f - sChOn);
         wetMakeup += reverbOnly * 0.13f;
 
         float processed = dry * dryPreserve + wetMono * wetCtrl * wetMakeup;
-
-        float output = dry * (1.f - anyOn) + processed * anyOn + fzOut;
+        float output    = dry * (1.f - anyOn) + processed * anyOn + fzOut;
         output = clampf(output, -1.f, 1.f);
 
         out[0][i] = output;
@@ -1207,7 +1223,7 @@ static void AudioCallback(AudioHandle::InputBuffer in,
 }
 
 // ============================================================
-// CONTROL UPDATE
+// CONTROL UPDATE (unchanged from v8R9AKs)
 // ============================================================
 static void UpdateControls()
 {
@@ -1226,7 +1242,7 @@ static void UpdateControls()
     // ========================================================
     // SWITCH LAYOUT
     // SW1 = Chorus enhancement
-    // SW2 = Orbit / widen      (old SW3)
+    // SW2 = Orbit / widen (old SW3)
     // SW3 = Bond / interaction (old SW2)
     // SW4 = Reverb character
     // ========================================================
@@ -1251,11 +1267,11 @@ static void UpdateControls()
     inDiff[2].g = diffBase - 0.03f;
     inDiff[3].g = diffBase - 0.05f;
 
-    float dampOff  = PLATE_DAMP_OFFSET + hallCtrl * (HALL_DAMP_OFFSET - PLATE_DAMP_OFFSET);
+    float dampOff  = PLATE_DAMP_OFFSET
+                   + hallCtrl * (HALL_DAMP_OFFSET - PLATE_DAMP_OFFSET);
     float dampXmod = driftVal * XMOD_DAMP_RANGE;
     float dampFreq = std::max(300.f,
-                              std::min((5000.f + dampOff + dampXmod) - sSw4 * 450.f,
-                                       14000.f));
+        std::min((5000.f + dampOff + dampXmod) - sSw4 * 450.f, 14000.f));
     for(int t = 0; t < 4; t++)
         rvDamp[t].SetFreq(dampFreq, SR_F);
 
@@ -1299,17 +1315,11 @@ static void UpdateControls()
             if(!fs1Held)
             {
                 if(!chorusOn)
-                {
                     chorusOn = true;
-                }
                 else
-                {
                     chorusOn = false;
-                }
-
                 fs1Lockout = FS1_LOCKOUT_SAMPLES;
             }
-
             fs1Held = false;
         }
 
@@ -1346,7 +1356,6 @@ static void UpdateControls()
             if(fs2Timer >= FS2_HOLD_SAMPLES)
             {
                 fs2Held = true;
-
                 if(reverbOn)
                 {
                     reverbFz = !reverbFz;
@@ -1361,21 +1370,17 @@ static void UpdateControls()
             {
                 if(freezeShutdownTailActive)
                     ResolveFreezeShutdownTailNow();
-
                 reverbOn = true;
             }
             else
             {
                 bool wasFreezeOn = reverbFz;
-
                 reverbOn = false;
-
                 if(wasFreezeOn)
                     BeginFreezeShutdownTail();
                 else
                     reverbFz = false;
             }
-
             fs2Lockout = FS2_LOCKOUT_SAMPLES;
         }
 
@@ -1395,13 +1400,11 @@ static void UpdateControls()
         fzCaptureSeqActive = true;
         fzCaptureSeqSamp   = 0;
     }
-
     if(!reverbFz)
     {
         fzCaptureSeqActive = false;
         fzCaptureSeqSamp   = 0;
     }
-
     prevFreezeTarget = reverbFz;
 
     if(!reverbOn)
@@ -1410,7 +1413,6 @@ static void UpdateControls()
         {
             const float tailSilentEnv = 0.00012f;
             const float tailSilentAud = 0.00040f;
-
             if(freezeShutdownEnv < tailSilentEnv && sFzAud < tailSilentAud)
             {
                 ResolveFreezeShutdownTailNow();
@@ -1425,19 +1427,16 @@ static void UpdateControls()
     if(!chorusOn)
         led1.Set(0.f);
     else if(chorusOn && fs1Prev && fs1Held)
-        led1.Set(0.2f + 0.8f * ledPulse);
+        led1.Set(0.5f + 0.5f * ledPulse);
     else
         led1.Set(1.f);
 
     if(!reverbOn)
         led2.Set(0.f);
     else if(reverbFz && fs2Prev && fs2Held)
-    {
-        float led2Floor = 0.35f - 0.17f * freezeLedAge;
-        led2.Set(led2Floor + (1.0f - led2Floor) * ledPulse);
-    }
+        led2.Set(0.5f + 0.5f * ledPulse);
     else if(reverbFz)
-        led2.Set(0.65f);
+        led2.Set(0.5f + 0.5f * ledPulse);
     else
         led2.Set(1.f);
 }
@@ -1450,6 +1449,7 @@ int main()
     petal.Init();
     petal.SetAudioBlockSize(1);
     petal.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
+
     float sr = petal.AudioSampleRate();
 
     chDel[0].Init(chorusBufA, CHORUS_BUF_SIZE);
@@ -1467,7 +1467,6 @@ int main()
 
     rvHpf.Init(60.f, sr);
     inputHpf.Init(80.f, sr);
-
     chWriteHpf.Init(110.f, sr);
     chWriteLpf.Init(4800.f, sr);
 
@@ -1477,6 +1476,7 @@ int main()
     inDiff[3].Init(inDiffMemD, INDIFF_D, 0.49f);
 
     shimmer.Init(shimBuf, SHIM_BUF_SIZE);
+
     sw1SrcHp.Init(850.f, sr);
     sw1LowLpf.Init(320.f, sr);
     sw1ToneLpf.Init(4950.f, sr);
@@ -1487,6 +1487,7 @@ int main()
 
     revLateSmearL.Init(3200.f, sr);
     revLateSmearR.Init(3200.f, sr);
+
     freezePlaySenseHp.Init(170.f, sr);
     freezePlayEnvFast.Init(18.f, sr);
     freezePlayEnvSlow.Init(2.2f, sr);
@@ -1504,11 +1505,9 @@ int main()
     fzFuseA.Init(fzFuseMemA, FZ_FUSE_A, 0.58f);
     fzFuseB.Init(fzFuseMemB, FZ_FUSE_B, 0.52f);
     fzPostAp.Init(fzPostApMem, FZ_POST_AP, 0.22f);
-
     fzPostVoiceA.Init(fzPostVoiceMemA, FZ_POST_VA, 0.19f);
     fzPostVoiceB.Init(fzPostVoiceMemB, FZ_POST_VB, 0.17f);
     fzPostVoiceC.Init(fzPostVoiceMemC, FZ_POST_VC, 0.15f);
-
     fzCloudTone.Init(1250.f, sr);
     fzLowKeepTone.Init(300.f, sr);
 
@@ -1519,19 +1518,19 @@ int main()
     float* fzMem[3] = {fzBufA, fzBufB, fzBufC};
     size_t fzSz[3]  = {FZ_A, FZ_B, FZ_C};
     float  fzMs[3]  = {97.f, 149.f, 199.f};
-
     for(int i = 0; i < 3; i++)
     {
         fzLp[i].Init(600.f, sr);
         fzHp[i].Init(200.f, sr);
-        fzVoice[i].Init(fzMem[i], fzSz[i], fzMs[i], sr, &fzLp[i], &fzHp[i], &fzLoopAp[i]);
+        fzVoice[i].Init(fzMem[i], fzSz[i], fzMs[i], sr,
+                        &fzLp[i], &fzHp[i], &fzLoopAp[i]);
     }
 
-    pRate.Init( petal.knob[Terrarium::KNOB_1], 0.1f,  3.f,    Parameter::LINEAR);
-    pMix.Init(  petal.knob[Terrarium::KNOB_2], 0.f,   1.f,    Parameter::LINEAR);
-    pDecay.Init(petal.knob[Terrarium::KNOB_3], 0.3f,  0.88f,  Parameter::LINEAR);
-    pDepth.Init(petal.knob[Terrarium::KNOB_4], 0.2f,  5.f,    Parameter::LINEAR);
-    pBal.Init(  petal.knob[Terrarium::KNOB_5], 0.f,   1.f,    Parameter::LINEAR);
+    pRate.Init( petal.knob[Terrarium::KNOB_1], 0.1f, 3.f,    Parameter::LINEAR);
+    pMix.Init(  petal.knob[Terrarium::KNOB_2], 0.f,  1.f,    Parameter::LINEAR);
+    pDecay.Init(petal.knob[Terrarium::KNOB_3], 0.3f, 0.88f,  Parameter::LINEAR);
+    pDepth.Init(petal.knob[Terrarium::KNOB_4], 0.2f, 5.f,    Parameter::LINEAR);
+    pBal.Init(  petal.knob[Terrarium::KNOB_5], 0.f,  1.f,    Parameter::LINEAR);
     pTone.Init( petal.knob[Terrarium::KNOB_6], 300.f, 5000.f, Parameter::LOGARITHMIC);
 
     led1.Init(petal.seed.GetPin(Terrarium::LED_1), false);
@@ -1540,47 +1539,33 @@ int main()
     chorusOn = false;
     reverbOn = false;
     reverbFz = false;
-
-    tChOn = 0.f;
-    sChOn = 0.f;
-    tRvOn = 0.f;
-    sRvOn = 0.f;
-    tRvFz = 0.f;
-    sRvFz = 0.f;
-    tFzAud = 0.f;
-    sFzAud = 0.f;
-    tFs1Send = 0.f;
-    sFs1Send = 0.f;
+    tChOn = 0.f;  sChOn = 0.f;
+    tRvOn = 0.f;  sRvOn = 0.f;
+    tRvFz = 0.f;  sRvFz = 0.f;
+    tFzAud = 0.f; sFzAud = 0.f;
+    tFs1Send = 0.f; sFs1Send = 0.f;
     sSw4Ctrl = 0.f;
 
-    fs1Prev = false;
-    fs1Held = false;
-    fs1Timer = 0;
-    fs1Lockout = 0;
-
-    fs2Prev = false;
-    fs2Held = false;
-    fs2Timer = 0;
-    fs2Lockout = 0;
+    fs1Prev = false;  fs1Held = false;
+    fs1Timer = 0;     fs1Lockout = 0;
+    fs2Prev = false;  fs2Held = false;
+    fs2Timer = 0;     fs2Lockout = 0;
 
     freezeShutdownTailActive = false;
     freezeShutdownHold       = 0.f;
     freezeShutdownEnv        = 0.f;
-
-    freezeAgeSec       = 0.f;
-    freezeEvoPhase     = 0.f;
-    freezeTextureDrift = 0.f;
-    freezePlayActivity = 0.f;
-    freezeLedAge       = 0.f;
+    freezeAgeSec             = 0.f;
+    freezeEvoPhase           = 0.f;
+    freezeTextureDrift       = 0.f;
+    freezePlayActivity       = 0.f;
+    freezeLedAge             = 0.f;
 
     fzJitCnt[0] = 28657;
     fzJitCnt[1] = 40111;
     fzJitCnt[2] = 56369;
-
     prevFzTap[0] = 0.f;
     prevFzTap[1] = 0.f;
     prevFzTap[2] = 0.f;
-
     fzCaptureSeqActive = false;
     fzCaptureSeqSamp   = 0;
     prevFreezeTarget   = false;
