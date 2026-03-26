@@ -1,5 +1,5 @@
 // ============================================================
-// MoonChild — v8R9AKs "Freeze Evolution V3a"
+// FLUX APPARITION — v8R9AKs "Freeze Evolution V3a"
 //
 // BASELINE
 // - Starts from v8R9AKp
@@ -419,7 +419,9 @@ struct FreezeVoice
         loopIn = loopAp->Process(loopIn);
         buf.Write(loopIn);
         float rd = buf.Read(bufSamps + modSamps);
-        fb = rd;
+        // Soft clamp feedback to prevent slow energy accumulation
+        // in the freeze loop over long hold times.
+        fb = clampf(rd, -1.f, 1.f);
         float sig = rd * holdGt;
         sig = lp->Process(sig);
         sig = hp->Process(sig);
@@ -491,6 +493,11 @@ static Ap     sw1SmoothAp;
 
 static Lp1    revLateSmearL;
 static Lp1    revLateSmearR;
+
+// DC blockers on cross-coupling feedback to prevent slow DC
+// accumulation in the chorus<->reverb feedback loop.
+static Hp1    dcBlockChOut;
+static Hp1    dcBlockRvOut;
 
 // Low-end recovery: extracts bass from rawDry to blend back
 // into the wet bus, compensating for HPFs on effect inputs.
@@ -934,7 +941,9 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
         // Raw dry is the unfiltered signal for bypass — no tone suck.
         // HPF'd dry feeds the effect engines only (removes DC/rumble
         // from reverb tank and chorus delay lines, not from your tone).
-        float rawDry = raw;
+        // Clamp raw input — the Daisy ADC can overshoot [-1,1] on
+        // transients from hot pickups / high-gain amps.
+        float rawDry = clampf(raw, -1.f, 1.f);
         float dry = inputHpf.Process(raw);
 
         float playSense  = freezePlaySenseHp.Process(dry);
@@ -1019,8 +1028,8 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
         processChorus(chIn, modDepth, sw2State, chL, chR);
         processReverb(rvIn, sw2State, rvL, rvR);
 
-        prevChOut = (chL + chR) * 0.5f;
-        prevRvOut = (rvL + rvR) * 0.5f;
+        prevChOut = dcBlockChOut.Process((chL + chR) * 0.5f);
+        prevRvOut = dcBlockRvOut.Process((rvL + rvR) * 0.5f);
 
         float rvMid  = (rvL + rvR) * 0.5f;
         float rvSide = (rvL - rvR) * 0.5f;
@@ -1129,6 +1138,13 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
         float bassAmt = anyOn * 0.38f;
         wetL += bassContent * bassAmt;
         wetR += bassContent * bassAmt;
+
+        // Safety clamp: bloom * width * level multipliers can stack
+        // up to ~8x at extreme settings before peak_limit. The allpass
+        // chain and tilt EQ don't reduce peaks. Catch anything that
+        // survived before the mono sum.
+        wetL = clampf(wetL, -2.f, 2.f);
+        wetR = clampf(wetR, -2.f, 2.f);
 
         // Hi-Fi: mono sum raised 0.7 -> 0.82 for more body
         float wetMono = (wetL + wetR) * 0.82f;
@@ -1535,6 +1551,16 @@ static void UpdateControls()
 int main()
 {
     petal.Init();
+
+    // Enable flush-to-zero on the Cortex-M7 FPU.
+    // Without this, denormal floats in filter states and allpass
+    // buffers cause software exception handling that takes 10-100x
+    // longer per operation, eventually overrunning the audio callback
+    // and causing glitches that get worse over time.
+    uint32_t fpscr = __get_FPSCR();
+    fpscr |= (1 << 24);  // FTZ bit
+    __set_FPSCR(fpscr);
+
     petal.SetAudioBlockSize(1);
     petal.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
 
@@ -1555,6 +1581,11 @@ int main()
 
     rvHpfL.Init(60.f, sr);
     rvHpfR.Init(60.f, sr);
+    // DC blockers on cross-coupling: 5 Hz cutoff is far below
+    // any audible content but catches slow DC drift in the
+    // chorus<->reverb feedback loop.
+    dcBlockChOut.Init(5.f, sr);
+    dcBlockRvOut.Init(5.f, sr);
     inputHpf.Init(80.f, sr);
     chWriteHpf.Init(80.f, sr);
     // 12kHz anti-alias is gentle enough to preserve pick attack
